@@ -8,6 +8,7 @@
 |------|------|
 | `auto_reply_11.py` | 主程序：多用户轮询 + LLM 随机 1~3 句回复 |
 | `stop_auto_reply.py` | 停止监听 |
+| `uia_keeper.py` | UI 守护，保持微信 UI 树可见（建议常开） |
 | `weixin_pace.py` | 操作节奏与补丁（被主程序引用） |
 | `llm_config.example.env` | 配置模板，复制为 `llm_config.local.env` |
 
@@ -19,10 +20,13 @@ copy llm_config.example.env llm_config.local.env
 
 # 2. 需已安装 pyweixin，且微信 4.1.6+ 已登录、UI 可见
 
-# 3. 启动
+# 3. 先开 UI 守护（可后台）
+python uia_keeper.py --bg
+
+# 4. 启动自动回复
 python -u auto_reply_11.py
 
-# 4. 停止
+# 5. 停止（同时停守护）
 python stop_auto_reply.py
 ```
 
