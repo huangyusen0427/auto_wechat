@@ -40,11 +40,41 @@ if str(TOOLS_DIR) not in sys.path:
 
 from weixin_pace import apply_pace, patch_wxid_folder_lookup
 
-from pyweixin import Contacts, Messages
+from pyweixin import Messages
 from pyweixin.Config import GlobalConfig
-from pyweixin.Uielements import Edits, Lists
+from pyweixin.Uielements import Buttons, Edits, Lists
 from pyweixin.WeChatTools import Navigator, Tools
 from pyweixin.utils import scan_for_new_messages
+
+# 扫描未读时跳过的系统会话（不是真人好友）
+SKIP_SCAN_NAMES = {
+    "折叠的聊天",
+    "折叠的群聊",
+    "Folded Chats",
+    "Minimized Chats",
+    "折疊的聊天",
+    "公众号",
+    "服务号",
+    "Service Accounts",
+    "Official Accounts",
+    "服務賬號",
+    "官方賬號",
+    "微信团队",
+    "Weixin Team",
+    "文件传输助手",
+    "File Transfer",
+}
+
+
+def is_pollable_friend(name: str) -> bool:
+    name = (name or "").strip()
+    if not name:
+        return False
+    if name in SKIP_SCAN_NAMES:
+        return False
+    if "折叠" in name or "Folded" in name or "Minimized" in name:
+        return False
+    return True
 
 SYSTEM_PROMPT = """你是 Claude Code 助手，在微信里帮用户写代码、答疑、聊天。
 
@@ -277,38 +307,60 @@ class FriendWxidCache:
         wxid = self.get(friend)
         return f"{friend}({wxid})" if wxid else f"{friend}(未知)"
 
-    def fetch_and_cache(self, friend: str) -> str | None:
+    def fetch_and_cache(self, friend: str, main_window=None) -> str | None:
         cached = self.get(friend)
         if cached:
             return cached
-        try:
-            profile = Contacts.get_friend_profile(
-                friend=friend,
-                is_maximize=False,
-                close_weixin=False,
-                search_pages=0,
-            )
-            wx_number = (profile.get("微信号") or "").strip()
-            if wx_number and wx_number != "无":
+        if main_window is not None:
+            wx_number = self._read_wxid_from_chatinfo(main_window, friend)
+            if wx_number:
                 self._data[friend] = wx_number
                 self.save()
                 _safe_print(f"[auto_reply] {friend}({wx_number}) 微信号已缓存")
                 return wx_number
-            _safe_print(f"[auto_reply] {friend} 资料页无微信号")
+        return None
+
+    def _read_wxid_from_chatinfo(self, main_window, friend: str) -> str | None:
+        """已在聊天窗时，从聊天信息侧栏读微信号，不另开资料弹窗。"""
+        wxnum_label = "微信号："
+        try:
+            if Tools.is_group_chat(main_window):
+                return None
+            chatinfo_button = main_window.child_window(**Buttons.ChatInfoButton)
+            if not chatinfo_button.exists(timeout=0.2):
+                return None
+            chatinfo_button.click_input()
+            time.sleep(0.35)
+            pane = main_window.child_window(
+                auto_id="single_chat_info_view", control_type="Group"
+            )
+            if not pane.exists(timeout=0.5):
+                chatinfo_button.click_input()
+                return None
+            texts = [item.window_text() for item in pane.descendants(control_type="Text")]
+            if wxnum_label in texts:
+                wx_number = texts[texts.index(wxnum_label) + 1].strip()
+                if wx_number and wx_number != "无":
+                    chatinfo_button.click_input()
+                    return wx_number
+            chatinfo_button.click_input()
         except Exception as e:
-            _safe_print(f"[auto_reply] {friend} 查询微信号失败: {e}")
+            _safe_print(f"[auto_reply] {friend} 侧栏读微信号失败: {e}")
         return None
 
     def prefetch_whitelist(self, friends: set[str]) -> None:
+        """仅读本地 JSON，启动时不打开资料页。"""
         for friend in sorted(friends):
             if self.get(friend):
                 _safe_print(f"[auto_reply] {self.label(friend)} 缓存命中")
             else:
-                self.fetch_and_cache(friend)
+                _safe_print(f"[auto_reply] {friend}(待查) 进入聊天后自动拉取")
+
+    def try_cache_from_chat(self, main_window, friend: str) -> None:
+        if not self.get(friend):
+            self.fetch_and_cache(friend, main_window=main_window)
 
     def ensure(self, friend: str) -> str:
-        if not self.get(friend):
-            self.fetch_and_cache(friend)
         return self.label(friend)
 
 
@@ -334,6 +386,7 @@ def seed_friend_baselines(
             if not text_items:
                 continue
             last_runtime[friend] = text_items[-1].element_info.runtime_id
+            wxid_cache.try_cache_from_chat(main_window, friend)
             _safe_print(f"[auto_reply] {wxid_cache.label(friend)} 基线已建立")
         except Exception as e:
             _safe_print(f"[auto_reply] {wxid_cache.label(friend)} 基线失败: {e}")
@@ -362,11 +415,19 @@ def build_poll_targets(
         return targets
 
     if scanned:
-        names = ", ".join(
-            f"{wxid_cache.label(k)} {v}条未读" for k, v in scanned.items()
-        )
-        _safe_print(f"[auto_reply] 扫描到未读: {names}")
+        valid = {k: v for k, v in scanned.items() if is_pollable_friend(k)}
+        skipped = [k for k in scanned if k not in valid]
+        if skipped:
+            _safe_print(f"[auto_reply] 跳过系统会话: {', '.join(skipped)}")
+        if valid:
+            names = ", ".join(
+                f"{wxid_cache.label(k)} {v}条未读" for k, v in valid.items()
+            )
+            _safe_print(f"[auto_reply] 扫描到未读: {names}")
+        scanned = valid
     for friend in scanned:
+        if not is_pollable_friend(friend):
+            continue
         targets.add(friend)
         if friend not in last_runtime:
             _safe_print(
@@ -407,6 +468,9 @@ def poll_friend_new_text(
     if not chat_list.exists(timeout=0.5) or not edit_area.exists(timeout=0.5):
         _safe_print(f"[auto_reply] {label} 聊天界面未就绪")
         return None
+
+    wxid_cache.try_cache_from_chat(main_window, friend)
+    label = wxid_cache.label(friend)
 
     Tools.activate_chatList(chat_list)
     text_items = [
@@ -451,7 +515,7 @@ def poll_and_reply_loop(
     last_runtime: dict[str, int] = {}
 
     ensure_wechat_centered()
-    _safe_print("[auto_reply] 微信已居中，预拉白名单微信号")
+    _safe_print("[auto_reply] 微信已居中，加载微信号缓存")
     wxid_cache.prefetch_whitelist(whitelist)
     _safe_print("[auto_reply] 建立白名单消息基线")
     seed_friend_baselines(whitelist, last_runtime, wxid_cache)
@@ -464,6 +528,8 @@ def poll_and_reply_loop(
             wxid_cache=wxid_cache,
         )
         for friend in sorted(targets):
+            if not is_pollable_friend(friend):
+                continue
             try:
                 content = poll_friend_new_text(friend, last_runtime, wxid_cache)
             except Exception as e:
