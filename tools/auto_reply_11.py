@@ -1,6 +1,7 @@
 """
-轮询白名单好友新消息，LLM 自动简短回复（随机 1~3 条，节奏随机但偏快）。
+独立自动回复脚本（仅依赖 weixin_pace.py，与 sync_poll_service.py 互不引用）。
 
+轮询白名单好友新消息，LLM 自动简短回复（随机 1~3 条，节奏随机但偏快）。
 经典模式：微信窗口居中 + 鼠标操作，多用户轮询。
 
 启动: python tools/auto_reply_11.py
@@ -39,11 +40,6 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from weixin_pace import apply_pace, patch_wxid_folder_lookup
-
-try:
-    from weixin_sync_lib import record_ai_outbound
-except ImportError:
-    record_ai_outbound = None  # type: ignore
 
 from pyweixin import Messages
 from pyweixin.Config import GlobalConfig
@@ -562,8 +558,6 @@ def poll_and_reply_loop(
                         search_pages=0,
                         send_delay=pace.send_delay(),
                     )
-                    if record_ai_outbound is not None:
-                        record_ai_outbound(friend, reply)
                     _safe_print(f"[auto_reply] 已回 {label}: {reply}")
                     if i < len(replies) - 1:
                         pace.reply_gap()
