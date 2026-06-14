@@ -40,6 +40,11 @@ if str(TOOLS_DIR) not in sys.path:
 
 from weixin_pace import apply_pace, patch_wxid_folder_lookup
 
+try:
+    from weixin_sync_lib import record_ai_outbound
+except ImportError:
+    record_ai_outbound = None  # type: ignore
+
 from pyweixin import Messages
 from pyweixin.Config import GlobalConfig
 from pyweixin.Uielements import Buttons, Edits, Lists
@@ -557,6 +562,8 @@ def poll_and_reply_loop(
                         search_pages=0,
                         send_delay=pace.send_delay(),
                     )
+                    if record_ai_outbound is not None:
+                        record_ai_outbound(friend, reply)
                     _safe_print(f"[auto_reply] 已回 {label}: {reply}")
                     if i < len(replies) - 1:
                         pace.reply_gap()
