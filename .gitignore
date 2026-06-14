@@ -3,3 +3,4 @@
 "*.venv"
 .idea/
 tools/llm_config.local.env
+tools/friend_wxid_cache.json

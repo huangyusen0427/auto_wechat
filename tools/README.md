@@ -33,4 +33,5 @@ python stop_auto_reply.py
 ## 注意
 
 - `llm_config.local.env` 含密钥，勿提交 git
+- `friend_wxid_cache.json` 为本地微信号缓存，自动生成
 - 运行时会居中微信窗口并使用鼠标，建议专用机部署

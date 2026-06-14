@@ -40,7 +40,7 @@ if str(TOOLS_DIR) not in sys.path:
 
 from weixin_pace import apply_pace, patch_wxid_folder_lookup
 
-from pyweixin import Messages
+from pyweixin import Contacts, Messages
 from pyweixin.Config import GlobalConfig
 from pyweixin.Uielements import Edits, Lists
 from pyweixin.WeChatTools import Navigator, Tools
@@ -240,14 +240,90 @@ def parse_scan_unread(cfg: dict[str, str]) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def seed_friend_baselines(friends: set[str], last_runtime: dict[str, int]) -> None:
+class FriendWxidCache:
+    """备注名 -> 微信号缓存，持久化到本地 JSON。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._data: dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._data = {str(k): str(v) for k, v in raw.items()}
+        except Exception as e:
+            _safe_print(f"[auto_reply] 读取微信号缓存失败: {e}")
+
+    def save(self) -> None:
+        try:
+            self.path.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            _safe_print(f"[auto_reply] 保存微信号缓存失败: {e}")
+
+    def get(self, friend: str) -> str | None:
+        wxid = (self._data.get(friend) or "").strip()
+        if wxid and wxid not in {"无", "未知"}:
+            return wxid
+        return None
+
+    def label(self, friend: str) -> str:
+        wxid = self.get(friend)
+        return f"{friend}({wxid})" if wxid else f"{friend}(未知)"
+
+    def fetch_and_cache(self, friend: str) -> str | None:
+        cached = self.get(friend)
+        if cached:
+            return cached
+        try:
+            profile = Contacts.get_friend_profile(
+                friend=friend,
+                is_maximize=False,
+                close_weixin=False,
+                search_pages=0,
+            )
+            wx_number = (profile.get("微信号") or "").strip()
+            if wx_number and wx_number != "无":
+                self._data[friend] = wx_number
+                self.save()
+                _safe_print(f"[auto_reply] {friend}({wx_number}) 微信号已缓存")
+                return wx_number
+            _safe_print(f"[auto_reply] {friend} 资料页无微信号")
+        except Exception as e:
+            _safe_print(f"[auto_reply] {friend} 查询微信号失败: {e}")
+        return None
+
+    def prefetch_whitelist(self, friends: set[str]) -> None:
+        for friend in sorted(friends):
+            if self.get(friend):
+                _safe_print(f"[auto_reply] {self.label(friend)} 缓存命中")
+            else:
+                self.fetch_and_cache(friend)
+
+    def ensure(self, friend: str) -> str:
+        if not self.get(friend):
+            self.fetch_and_cache(friend)
+        return self.label(friend)
+
+
+def seed_friend_baselines(
+    friends: set[str],
+    last_runtime: dict[str, int],
+    wxid_cache: FriendWxidCache,
+) -> None:
     """启动时给每个白名单好友建立基线，避免第一次轮询把未读当旧消息跳过。"""
     for friend in sorted(friends):
         try:
             main_window = open_friend_chat(friend)
             chat_list = main_window.child_window(**Lists.FriendChatList)
             if not chat_list.exists(timeout=0.5):
-                _safe_print(f"[auto_reply] {friend} 基线跳过: 无消息列表")
+                _safe_print(f"[auto_reply] {wxid_cache.label(friend)} 基线跳过: 无消息列表")
                 continue
             Tools.activate_chatList(chat_list)
             text_items = [
@@ -258,9 +334,9 @@ def seed_friend_baselines(friends: set[str], last_runtime: dict[str, int]) -> No
             if not text_items:
                 continue
             last_runtime[friend] = text_items[-1].element_info.runtime_id
-            _safe_print(f"[auto_reply] {friend} 基线已建立")
+            _safe_print(f"[auto_reply] {wxid_cache.label(friend)} 基线已建立")
         except Exception as e:
-            _safe_print(f"[auto_reply] {friend} 基线失败: {e}")
+            _safe_print(f"[auto_reply] {wxid_cache.label(friend)} 基线失败: {e}")
 
 
 def scan_unread_friends() -> dict[str, int]:
@@ -274,6 +350,7 @@ def build_poll_targets(
     *,
     scan_unread: bool,
     last_runtime: dict[str, int],
+    wxid_cache: FriendWxidCache,
 ) -> set[str]:
     targets = set(whitelist)
     if not scan_unread:
@@ -285,12 +362,16 @@ def build_poll_targets(
         return targets
 
     if scanned:
-        names = ", ".join(f"{k}({v})" for k, v in scanned.items())
+        names = ", ".join(
+            f"{wxid_cache.label(k)} {v}条未读" for k, v in scanned.items()
+        )
         _safe_print(f"[auto_reply] 扫描到未读: {names}")
     for friend in scanned:
         targets.add(friend)
         if friend not in last_runtime:
-            _safe_print(f"[auto_reply] {friend} 新发现(有未读)，将纳入轮询")
+            _safe_print(
+                f"[auto_reply] {wxid_cache.label(friend)} 新发现(有未读)，将纳入轮询"
+            )
     return targets
 
 
@@ -313,13 +394,18 @@ def open_friend_chat(friend: str):
     return main_window
 
 
-def poll_friend_new_text(friend: str, last_runtime: dict[str, int]) -> str | None:
+def poll_friend_new_text(
+    friend: str,
+    last_runtime: dict[str, int],
+    wxid_cache: FriendWxidCache,
+) -> str | None:
     """轮询单个好友最新文本（鼠标激活聊天列表 + 拍一拍判断收发）。"""
+    label = wxid_cache.label(friend)
     main_window = open_friend_chat(friend)
     chat_list = main_window.child_window(**Lists.FriendChatList)
     edit_area = main_window.child_window(**Edits.CurrentChatEdit)
     if not chat_list.exists(timeout=0.5) or not edit_area.exists(timeout=0.5):
-        _safe_print(f"[auto_reply] {friend} 聊天界面未就绪")
+        _safe_print(f"[auto_reply] {label} 聊天界面未就绪")
         return None
 
     Tools.activate_chatList(chat_list)
@@ -340,7 +426,7 @@ def poll_friend_new_text(friend: str, last_runtime: dict[str, int]) -> str | Non
             return None
         content = (latest.window_text() or "").strip()
         if content:
-            _safe_print(f"[auto_reply] {friend} 首次发现对方消息")
+            _safe_print(f"[auto_reply] {label} 首次发现对方消息")
         return content or None
     if runtime_id == prev:
         return None
@@ -359,25 +445,29 @@ def poll_and_reply_loop(
     engine: ShortReplyEngine,
     pace: RandomPace,
     scan_unread: bool,
+    wxid_cache: FriendWxidCache,
 ) -> None:
     processed: set[str] = set()
     last_runtime: dict[str, int] = {}
 
     ensure_wechat_centered()
-    _safe_print("[auto_reply] 微信已居中，建立白名单基线")
-    seed_friend_baselines(whitelist, last_runtime)
+    _safe_print("[auto_reply] 微信已居中，预拉白名单微信号")
+    wxid_cache.prefetch_whitelist(whitelist)
+    _safe_print("[auto_reply] 建立白名单消息基线")
+    seed_friend_baselines(whitelist, last_runtime, wxid_cache)
 
     while True:
         targets = build_poll_targets(
             whitelist,
             scan_unread=scan_unread,
             last_runtime=last_runtime,
+            wxid_cache=wxid_cache,
         )
         for friend in sorted(targets):
             try:
-                content = poll_friend_new_text(friend, last_runtime)
+                content = poll_friend_new_text(friend, last_runtime, wxid_cache)
             except Exception as e:
-                _safe_print(f"[auto_reply] 轮询 {friend} 失败: {e}")
+                _safe_print(f"[auto_reply] {wxid_cache.label(friend)} 轮询失败: {e}")
                 continue
 
             if not content:
@@ -388,7 +478,8 @@ def poll_and_reply_loop(
                 continue
             processed.add(key)
 
-            _safe_print(f"[auto_reply] {friend} -> {content[:60]}")
+            label = wxid_cache.ensure(friend)
+            _safe_print(f"[auto_reply] {label} -> {content[:60]}")
             try:
                 replies = engine.generate(friend, content)
                 for i, reply in enumerate(replies):
@@ -400,12 +491,12 @@ def poll_and_reply_loop(
                         search_pages=0,
                         send_delay=pace.send_delay(),
                     )
-                    _safe_print(f"[auto_reply] 已回 {friend}: {reply}")
+                    _safe_print(f"[auto_reply] 已回 {label}: {reply}")
                     if i < len(replies) - 1:
                         pace.reply_gap()
-                    poll_friend_new_text(friend, last_runtime)
+                    poll_friend_new_text(friend, last_runtime, wxid_cache)
             except Exception as e:
-                _safe_print(f"[auto_reply] 回复 {friend} 失败: {e}")
+                _safe_print(f"[auto_reply] 回复 {label} 失败: {e}")
 
         pace.poll_sleep()
 
@@ -436,6 +527,7 @@ def main() -> None:
         model=model,
         pace=pace,
     )
+    wxid_cache = FriendWxidCache(TOOLS_DIR / "friend_wxid_cache.json")
 
     _safe_print(f"[auto_reply] 白名单: {', '.join(friends)}")
     _safe_print(f"[auto_reply] 模型: {model}")
@@ -446,6 +538,7 @@ def main() -> None:
         f"[auto_reply] 轮询: {pace.poll_min}~{pace.poll_max}s | "
         f"发送: {pace.send_min}~{pace.send_max}s"
     )
+    _safe_print("[auto_reply] 日志: 备注(微信号) -> 消息")
     _safe_print("[auto_reply] 停止: python tools/stop_auto_reply.py")
 
     try:
@@ -454,6 +547,7 @@ def main() -> None:
             engine=engine,
             pace=pace,
             scan_unread=scan_unread,
+            wxid_cache=wxid_cache,
         )
     except KeyboardInterrupt:
         _safe_print("\n[auto_reply] 已停止")
